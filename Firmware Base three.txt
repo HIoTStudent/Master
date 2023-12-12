@@ -1,0 +1,69 @@
+#include <WiFi.h>
+#include <DHT.h>
+
+const char* ssid = "SuaSSID";
+const char* password = "SuaSenha";
+const char* zabbixServer = "IP_do_Servidor_Zabbix";
+const int zabbixPort = 10051;
+
+#define DHTPIN 4
+#define DHTTYPE DHT11
+
+DHT dht(DHTPIN, DHTTYPE);
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println("\nConectado à rede Wi-Fi");
+
+  dht.begin();
+}
+
+void loop() {
+  delay(2000);
+
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+
+  Serial.print("Umidade: ");
+  Serial.print(humidity);
+  Serial.print("%\t");
+  Serial.print("Temperatura: ");
+  Serial.print(temperature);
+  Serial.println("°C");
+
+  sendToZabbix("Nome_do_Host", "Chave_Item_Temperatura", temperature);
+  sendToZabbix("Nome_do_Host", "Chave_Item_Umidade", humidity);
+}
+
+void sendToZabbix(const char* host, const char* key, float value) {
+  // Abre uma conexão TCP com o servidor Zabbix
+  WiFiClient client;
+  if (client.connect(zabbixServer, zabbixPort)) {
+    // Formata os dados no formato esperado pelo Zabbix Sender
+    String data = "{\"request\":\"sender data\",\"data\":[{\"host\":\"" + String(host) + "\",\"key\":\"" + String(key) + "\",\"value\":\"" + String(value) + "\"}]}";
+
+    // Envia os dados para o servidor Zabbix
+    client.print(data);
+
+    Serial.println("Dados enviados para o Zabbix");
+
+    // Aguarda a resposta do servidor (opcional)
+    while (client.connected()) {
+      String line = client.readStringUntil('\n');
+      if (line == "ZBXD\1") {
+        Serial.println("Resposta do Zabbix recebida com sucesso");
+      }
+    }
+  } else {
+    Serial.println("Falha ao conectar-se ao servidor Zabbix");
+  }
+
+  // Fecha a conexão
+  client.stop();
+}

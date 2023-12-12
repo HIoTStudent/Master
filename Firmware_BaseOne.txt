@@ -1,0 +1,1367 @@
+// Os delays das linhas 414 e 509 foram removidos pois estavam gerando problemas. Conteúdo das linhas: "delay(500);"
+// O processo de criação do arquivo de configuração do Endpoint começa na linha 210 e termina na linha 219
+// A leitura dos sensores começa na linha 719 e termina na linha 750
+// Variável de calibração do sensor de peso na linha 45: float calibrationValue = 36.08;
+
+String firmware = "HIoT_baseone"; // 20 caracteres disponíveis para o nome, pois ("Firm":"" ) 10 estruturais.
+String vers = "_v0.1";
+String espOtaUrl = "";          // Firmware OTA Url
+
+int otaConection = 0;           // Contador que define o limite de tentativas de atualização do firmware
+
+// Dados para autenticação da comunicação MQTT
+const int mqttPort = 1883;
+const char *mqttUser = "defaultfatec";
+const char *mqttPass = "defaultfatec";
+
+// Dados para autenticação no acesso a REST API
+const char *auth_username = "admin";
+const char *auth_password = "defaultfatec";
+
+bool mqttConection = false; // Variável de status da conexão MQTT
+
+#include "WiFi.h"              // Usada para viabilizar a comunicação Wifi
+#include "PubSubClient.h"      // Usada para viabilizar as requisições MQTT, para o envio das informações coletadas pelos sensores
+#include "HTTPClient.h"        // Usada para viabilizar as requisições HTTP, para buscar um novo Firmware
+#include "ESP32httpUpdate.h"   // Usada para viabilizar a atualização OTA do firmware
+#include "WebServer.h"         // Usada para viabilizar a Rest API
+#include "ArduinoJson.h"       // Usada para viabilizar a trataiva do JSON armazenado no arquivo de configuração
+#include "FS_File_Record.h"    // Usada para viabilizar o armazenamento das configurações do endpoint em um arquivo
+#include "DNSServer.h"         // Usada para viabilizar um acesso amigável a interface (não implementada)
+#include "WiFiManager.h"       // Usada para viabilizar a interface de configuração do endpoint
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "soc/rtc.h"           // Usada para ajustar o clock do microcontrolador ESP32-D
+#include "DHTesp.h"            // Usada para viabilizar a leitura do sensor DHT22 no ESP32
+
+/*//HX711 pins:
+const int HX711_dout = 25; //mcu > HX711 dout pin
+const int HX711_sck = 26; //mcu > HX711 sck pin
+
+//HX711 constructor:
+HX711_ADC LoadCell(HX711_dout, HX711_sck);
+
+float calibrationValue = 36.08; // Calibra o sensor de peso
+unsigned long t = 0;            // Intervalo de leitura*/
+float weight = 0.0;             // Armazena o valor do peso - Independente do modo de coleta do peso, utilize esta variável para armazenar esse dado.
+
+int ldr = 36;                   // Pino do sensor de luminosidade
+int valorldr = 0;               // Valor bruto lido da porta analógica do sensor
+int luminosidade = 0;           // Valor de luminosidade calibrado
+
+int ruido = 34;                 // Pino do sensor de ruído
+int ValorSensor = 0;            // Valor bruto lido da porta analógica do sensor
+int valorMaior = 0;             // Maior valor dentre os valores lidos
+float tensao = 0;               // Calcula a tensão no sensor
+int dB = 0;                     // Valor do ruído calibrado em decibeis
+int cont = 0;                   // Contador de leituras para a coleta do maior valor
+
+String weightValue = "";        // String que armazena a parte do JSON referente ao peso
+String lumiValue = "";          // String que armazena a parte do JSON referente a luminosidade
+String soundValue = "";         // String que armazena a parte do JSON referente ao ruído
+
+char weightExit[30];            // Armazena a String do sensor de peso convertida para o vetor de char, para enviar pela Serial ou por MQTT sem nenhum problema
+char lumiExit[30];              // Armazena a String do sensor de luminosidade convertida para o vetor de char, para enviar pela Serial ou por MQTT sem nenhum problema
+char soundExit[30];             // Armazena a String do sensor de ruido convertida para o vetor de char, para enviar pela Serial ou por MQTT sem nenhum problema
+
+String dhtTempValue = "";      // Dado convertido para permitir o envio MQTT do sensor DHT de temperatura
+String dhtHumiValue = "";      // Dado convertido para permitir o envio MQTT do sensor DHT de umidade
+char dhtTempExit[30];          // Dado recebido para envio MQTT do sensor DHT de temperatura
+char dhtHumiExit[30];          // Dado recebido para envio MQTT do sensor DHT de umidade
+
+String serialRead = "";        // Não usada nesse firmware, mas geralmente aproveito ela para alguns testes 
+
+bool jsonMqtt = false;         // Não usada nesse firmware, não lembro bem para o que usava, mas eu deixaria aqui pra garantir kkkk
+
+String topicReceived = "";     // Recebe o tópico da mensagem MQTT enviado pelo Gateway
+String messageReceived = "";   // Recebe a mensagem MQTT enviada pelo Gateway
+String token = "";             // Token da REST API
+char authentication[30];       // Usada para um teste de autenticação fracassado na REST API, deixei aqui pra testar futuramente
+String authFailResponse = "Authentication Failed"; // Usada para o teste de autenticação fracassado na REST API, deixei pra testar novamente depois também
+
+// Nas duas linhas abaixo está comentada a referência do arquivo de configuração no esp32 do firmware
+// Tamanho dos registros de configuração (máximo de 172 caracteres), com 28 compartilhadas entre o sender e febre, somando-se 28, totalizando 200 caracteres, exemplo de JSON:
+// {"Ip":"192.168.192.168","Gt":"192.168.192.168","Nm":"255.255.255.255","Gw":"192.168.192.168","Tkn":"Gb8:27:eb:55:ed:28E08:3A:F2:AC:06:60T","Cfg":"stable","Snd":"99999999999999","Fbr":"99999999999999"}
+
+const int sizeOfRecord = 200;  // Quantidade de caracteres máximos por linha no arquivo de configuração, como é possível observar
+char regJson[200];             // Armazena a linha do arquivo de configuração em um vetor de char, pois assim como o MQTT, trabalhar com JSONs no ESP32 é mais viável utilizando vetores de caracteres ao invés da String em si
+
+String errorMsg; // String que recebe as mensagens de erro do SPIFFS
+String value = "";
+String values = ""; // Variável que recebe as informações de rede pela Serial
+String reg = "";    // Variável que recebe as informações de rede armazenadas no arquivo
+String linha = "";  // Variável que busca as informações de rede armazenadas no arquivo
+
+String sensor = ""; // Não utilizado neste firmware mas evitar remoção.
+
+int count = 0;
+int countMqtt = 0;
+int i = 0;          // Contador do gerenciador da comunicação MQTT
+int timer = 0;      // Usado para definir o tempo de atraso na inicialização do ESP32
+int await = 0;      // Usado para realizar o atraso na inicialização do ESP32, para garantir que, caso o ESP32 e raspberry sejam inicializados simultaneamente, o esp aguarde um tempo em espera, para que o rasp inicialize todos os serviços de comunicação a tempo do ESP32 realizar a tentativa de conexão
+int progress = 0;   // Usada para demonstrar o status dessa espera em porcentagem
+
+String dinamicMac = "";       // String que armazena o Endereço MAC bruto do Endpoint
+String macAddressJson = "";   // String que armazena a parte do JSON referente ao Endereço MAC do Endpoint
+String macAddressValue = "";  // String que armazena o Endereço MAC pouco tratado do Endpoint
+String esp32IP = "";          // Variável de Endereço IP do esp32
+String esp32IPValue = "";     // String que armazena a parte do JSON referente ao Endereço IP do ESP32
+String firmwareValue = "";    // String que armazena a parte do JSON referente ao Firmware do Endpoint
+String versionValue = "";
+String topicValue = "";
+
+char startExit[] = "{ ";
+char endExit[] = " } "; // Chave de fechamento do objeto Json para envio MQTT
+char macAddressExit[30];
+char macAddressValueExit[30]; // Armazena a String do Endereço MAC pouco tratado "macAddressValue" convertida para o vetor de char, para enviar por MQTT para o Endpoint se cadastrar, ou validar seu cadastro no Gateway
+char esp32IPExit[30]; // Dado recebido para envio MQTT do endereço IP do ESP32
+char firmwareExit[30];
+char versionExit[30];
+char topicExit[30];
+
+String fs_ip = "";
+String fs_gt = "";
+String fs_nm = "";
+String fs_gw = "";
+
+bool wifiConnected = false;
+bool wifiConfig = false;
+String endpointConfig;
+
+IPAddress ip;
+IPAddress gt;
+IPAddress nt;
+
+// Objetos do programa...
+WiFiClient conexaoWiFi;           // Objeto da conexão WiFi
+PubSubClient client(conexaoWiFi); // Objeto de comunicação MQTT
+
+// Web server running on port 80
+WebServer server(80);
+
+FS_File_Record ObjFS("/config.bin", sizeOfRecord);
+
+WiFiManager wifiManager; //Objeto de manipulação do wi-fi
+
+DHTesp dhtSensor1;              // Cria objeto DHT22
+TempAndHumidity sensor1Data;    // Cria o objeto de operação do DHTesp
+
+void setup()
+{
+  Serial.begin(115200);
+  
+  // Se não foi possível iniciar o File System, exibimos erro e reiniciamos o ESP
+  if (!ObjFS.init()){
+    Serial.println("File system error");
+    delay(1000);
+    ESP.restart();
+  }
+
+  // Exibimos mensagem
+  Serial.println("File system ok");
+
+  // Se o arquivo não existe, criamos o arquivo
+  if (!ObjFS.fileExists()){
+    Serial.println("New file");
+    ObjFS.newFile(); // Cria o arquivo
+  } // !ObjFS.fileExists()
+
+  // Posiciona o ponteiro do arquivo no início
+  ObjFS.rewind();
+
+  StaticJsonDocument<200> doc; // Memory pool
+
+  // Percorre todos os registros
+  if (ObjFS.readFileNextRecord(&linha, &errorMsg))
+  {
+    reg = linha;
+    reg.toCharArray(regJson, reg.length());
+    delay(100);
+    Serial.print("JSON: ");
+    Serial.println(regJson);
+
+    // Trata as informações do JSON
+    auto error = deserializeJson(doc, regJson);
+
+    if (error || !wifiConfig)
+    {
+      String jsonIp = doc["Ip"];
+      String jsonGt = doc["Gt"];
+      String jsonNm = doc["Nm"];
+      String jsonGw = doc["Gw"];
+      String jsonToken = doc["Tkn"];
+      String jsonCfg = doc["Cfg"];
+      String jsonCnt = doc["Cnt"];
+
+      count = jsonCnt.toInt();
+      count++;
+
+      value = "{\"Ip\":\""+ jsonIp +"\",\"Gt\":\""+ jsonGt +"\",\"Nm\":\""+ jsonNm +"\",\"Gw\":\""+ jsonGw +"\",\"Tkn\":\""+ jsonToken +"\",\"Cfg\":\""+ jsonCfg +"\",\"Cnt\":\""+ count +"\"} ";
+
+      ObjFS.destroyFile();
+
+      Serial.println("----------------------------");
+      Serial.println(value);
+      Serial.println("----------------------------");
+
+      if (value != "" && !ObjFS.writeFile(value, &errorMsg))
+      {
+        Serial.println(errorMsg);
+      }    // values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+      else // values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+      {
+        Serial.println("Save File Ok");
+      } // else values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+
+    } // error deserializing
+  }   // if(ObjFS.readFileNextRecord(&linha, &errorMsg)*/
+
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector   
+
+  delay(5000);
+  rtc_clk_cpu_freq_set(RTC_CPU_FREQ_80M);
+  Serial.println("Starting...");
+
+  // Posiciona o ponteiro do arquivo no início
+  ObjFS.rewind();
+
+  //StaticJsonDocument<200> doc; // Memory pool
+
+  // Percorre todos os registros
+  if (ObjFS.readFileNextRecord(&linha, &errorMsg))
+  {
+    reg = linha;
+    reg.toCharArray(regJson, reg.length());
+    delay(100);
+    Serial.print("JSON: ");
+    Serial.println(regJson);
+
+    // Trata as informações do JSON
+    auto error = deserializeJson(doc, regJson);
+
+    if (error || !wifiConfig)
+    {
+      String jsonIp = doc["Ip"];
+      String jsonGt = doc["Gt"];
+      String jsonNm = doc["Nm"];
+      String jsonGw = doc["Gw"];
+      String jsonToken = doc["Tkn"];
+      String jsonCfg = doc["Cfg"];
+
+      int reset = 0;
+
+      value = "{\"Ip\":\""+ jsonIp +"\",\"Gt\":\""+ jsonGt +"\",\"Nm\":\""+ jsonNm +"\",\"Gw\":\""+ jsonGw +"\",\"Tkn\":\""+ jsonToken +"\",\"Cfg\":\""+ jsonCfg +"\",\"Cnt\":\""+ reset +"\"} ";
+
+      ObjFS.destroyFile();
+
+      Serial.println("----------------------------");
+      Serial.println(value);
+      Serial.println("----------------------------");
+
+      if (value != "" && !ObjFS.writeFile(value, &errorMsg))
+      {
+        Serial.println(errorMsg);
+      }    // values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+      else // values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+      {
+        Serial.println("Save File Ok");
+      } // else values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+
+    } // error deserializing
+  }   // if(ObjFS.readFileNextRecord(&linha, &errorMsg)*/
+
+/*
+  LoadCell.begin();
+  //LoadCell.setReverseOutput(); //uncomment to turn a negative output value to positive
+
+  unsigned long stabilizingtime = 2000; // preciscion right after power-up can be improved by adding a few seconds of stabilizing time
+  boolean _tare = true; //set this to false if you don't want tare to be performed in the next step
+  LoadCell.start(stabilizingtime, _tare);
+  if (LoadCell.getTareTimeoutFlag()) {
+    Serial.println("Timeout, check MCU>HX711 wiring and pin designations");
+    while (1){ ESP.restart(); }
+  }
+  else {
+    LoadCell.setCalFactor(calibrationValue); // set calibration value (float)
+    Serial.println("Startup is complete");
+  }
+*/
+  pinMode(ldr, INPUT);
+  pinMode(ruido, INPUT);
+  dhtSensor1.setup(23, DHTesp::DHT22); // Inicializa o sensor DHT22
+
+  // callback para quando entra em modo de configuração AP
+  wifiManager.setAPCallback(configModeCallback);
+  // callback para quando se conecta em uma rede, ou seja, quando passa a trabalhar em modo estação
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+
+  Serial.println();
+
+  // Cria a tarefa "TaskRunning" com prioridade 1, atribuída ao core 0
+  xTaskCreatePinnedToCore(TaskRunning,
+                          "TaskOnPro",
+                          2048,
+                          NULL,
+                          8,
+                          NULL,
+                          tskNO_AFFINITY);
+ // delay(1);
+
+  /*// Inicia a criação do arquivo de configuração para o primeiro carregamento de firmware no Endpoint
+  value = "{\"Ip\":\"0.0.0.0\",\"Gt\":\"0.0.0.0\",\"Nm\":\"0.0.0.0\",\"Gw\":\"192.168.1.1\",\"Tkn\":\"tkn\",\"Cfg\":\"config\"} ";
+
+  ObjFS.destroyFile();
+
+  Serial.println("----------------------------");
+  Serial.println(value);
+  Serial.println("----------------------------");
+
+  if (value != "" && !ObjFS.writeFile(value, &errorMsg))
+  {
+    Serial.println(errorMsg);
+  }    // values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+  else // values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+  {
+    Serial.println("Save File Ok");
+  } // else values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+
+  Serial.println("Done!!!"); // */
+  // Finaliza a criação do arquivo de configuração para o primeiro carregamento de firmware no Endpoint
+
+  //timeAwait();
+
+  // ObjFS.destroyFile();
+
+} // setup
+
+// Segunda task responsavel por monitorar o status do controlador de reset de fábrica
+void TaskRunning(void *arg)
+{
+  while (1)
+  {
+    checkSound();
+    vTaskDelay(500); // Tempo de execução dessa task | Testar com 0
+  }
+} // TaskRunning
+
+void loop()
+{
+  delay(500);
+
+  if (wifiConfig || count >= 3)
+  {
+    wifiManager.disconnect();
+    wifiManager.resetSettings(); // Apaga rede salva anteriormente
+    wifiManager.erase(true);     // Apaga também os IPs da rede salva anteriormente
+
+    if (!ObjFS.fileExists())
+    {
+      Serial.println("New file");
+      ObjFS.newFile(); // Cria o arquivo
+    }                  // !ObjFS.fileExists()
+
+    // ESP.restart();
+
+    // Posiciona o ponteiro do arquivo no início
+    ObjFS.rewind();
+
+    StaticJsonDocument<200> doc; // Memory pool
+
+    // Percorre todos os registros
+    if (ObjFS.readFileNextRecord(&linha, &errorMsg))
+    {
+      reg = linha;
+      reg.toCharArray(regJson, reg.length());
+      delay(100);
+      Serial.print("JSON: ");
+      Serial.println(regJson);
+
+      // Trata as informações do JSON
+      auto error = deserializeJson(doc, regJson);
+
+      if (error || wifiConfig || count >= 3)
+      {
+        String jsonIp = doc["Ip"];
+        String jsonGt = doc["Gt"];
+        String jsonNm = doc["Nm"];
+        String jsonGw = doc["Gw"];
+        String jsonToken = doc["Tkn"];
+        String jsonCnt = doc["Cnt"];
+
+        value = "{\"Ip\":\""+ jsonIp +"\",\"Gt\":\""+ jsonGt +"\",\"Nm\":\""+ jsonNm +"\",\"Gw\":\""+ jsonGw +"\",\"Tkn\":\""+ jsonToken +"\",\"Cfg\":\"config\",\"Cnt\":\""+ jsonCnt +"\"} ";
+
+        ObjFS.destroyFile();
+
+        Serial.println("----------------------------");
+        Serial.println(value);
+        Serial.println("----------------------------");
+
+        if (value != "" && !ObjFS.writeFile(value, &errorMsg))
+        {
+          Serial.println(errorMsg);
+        }    // values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+        else // values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+        {
+          Serial.println("Save File Ok");
+        } // else values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+
+        wifiManager.stopConfigPortal();
+        ESP.restart();
+      } // error deserializing
+    }   // if(ObjFS.readFileNextRecord(&linha, &errorMsg) && wifiConfig)*/
+  }     // wifiConfig || count == 3
+  else if (!wifiConfig && !wifiConnected)
+  {
+    // Posiciona o ponteiro do arquivo no início
+    if (!ObjFS.fileExists())
+    {
+      Serial.println("New file");
+      ObjFS.newFile(); // Cria o arquivo
+    }                       // !ObjFS.fileExists()
+
+    // Posiciona o ponteiro do arquivo no início
+    ObjFS.rewind();
+
+    StaticJsonDocument<200> doc; // Memory pool
+
+    linha = " ";
+    Serial.print("linha: ");
+    Serial.println(linha);
+
+    // Percorre todos os registros
+    while (ObjFS.readFileNextRecord(&linha, &errorMsg) && linha != "")
+    {
+      reg = linha;
+      reg.toCharArray(regJson, reg.length());
+      delay(100);
+      Serial.print("JSON: ");Serial.println(regJson);
+
+      // Trata as informações do JSON
+      auto error = deserializeJson(doc, regJson);
+
+      if (error)
+      {
+        Serial.print(F("deserializeJson() failed with code "));
+        Serial.println(error.c_str());
+        
+        Serial.println(" ");
+        Serial.println("ESP32 não configurado!");
+        Serial.println("Insira o comando: \"start\" para iniciar o processo de configuração");
+        Serial.println(" ");
+
+        return;
+      } // error deserializing
+
+    } // while(ObjFS.readFileNextRecord(&linha, &errorMsg) && lina!= "")
+
+    const char *jsonIp = doc["Ip"];
+    const char *jsonGt = doc["Gt"];
+    const char *jsonNm = doc["Nm"];
+    const char *jsonGw = doc["Gw"];
+    const char *jsonConfig = doc["Cfg"];
+
+    endpointConfig = String(jsonConfig);
+
+    Serial.print("Ip: ");Serial.println(jsonIp);
+    Serial.print("Gt: ");Serial.println(jsonGt);
+    Serial.print("Nm: ");Serial.println(jsonNm);
+    Serial.print("Gw: ");Serial.println(jsonGw);
+    Serial.print("Cfg: ");Serial.println(jsonConfig);
+
+    espOtaUrl = "http://"+ String(jsonGw) +":8000/"+ firmware +".ino.bin"; // Exemplo: http://192.168.1.1:8000/espOtafatec.ino.bin
+
+    Serial.println();
+
+    dinamicMac = WiFi.macAddress();
+    macAddressValue = dinamicMac + " ";
+    topicValue = "esp32/mac/" + dinamicMac + " ";
+    macAddressJson = "\"Mac\":\"" + dinamicMac + "\", ";
+
+    String endpointNetwork = "Net-Endpoint-"+ macAddressValue;
+    char endpointSSID[40];
+
+    endpointNetwork.toCharArray(endpointSSID, endpointNetwork.length());
+
+    String ipString = "0.0.0.0";
+    String ipJson = String(jsonIp);
+
+    Serial.print("IpString: ");Serial.print(ipString);Serial.print(" --- ipJson: ");Serial.println(ipJson);
+
+    if (String(jsonConfig) == "stable")
+    {
+      if (ipString == ipJson) // Se configurado DHCP
+      {
+        wifiManager.autoConnect(endpointSSID, "defaultfatec"); // Função para se autoconectar na rede
+        wifiManager.stopConfigPortal();
+
+        WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 1); //disable brownout detector
+
+        wifiConfig = false;
+        wifiConnected = true;
+
+        client.setServer(jsonGw, mqttPort);
+        client.setCallback(callback);
+
+        Serial.println();
+
+        topicValue.toCharArray(topicExit, topicValue.length());
+        macAddressValue.toCharArray(macAddressValueExit, macAddressValue.length());
+        macAddressJson.toCharArray(macAddressExit, macAddressJson.length());
+
+        delay(500);
+
+        firmwareValue = "\"Firm\":\"" + firmware + "\", ";
+        firmwareValue.toCharArray(firmwareExit, firmwareValue.length());
+
+        versionValue = "\"Ver\":\"" + vers + "\", ";
+        versionValue.toCharArray(versionExit, versionValue.length());
+
+        esp32IP = WiFi.localIP().toString();
+        esp32IPValue = "\"Ip\":\"" + esp32IP + "\" ";
+        esp32IPValue.toCharArray(esp32IPExit, esp32IPValue.length());
+
+        Serial.print("ESP Board Mac Address:  ");Serial.println(dinamicMac);
+        Serial.print("ESP Board IP Address:  ");Serial.println(esp32IP);
+        Serial.print("ESP Board Firmware Version:  ");Serial.println(firmware);
+
+        //delay(500);
+
+        Serial.println();
+
+        if (!client.connected())
+        {
+          Serial.println("Conectando ao broker MQTT");
+          delay(1000);
+          if (client.connect(macAddressValueExit, mqttUser, mqttPass))
+          {
+            mqttConection = true;
+          }
+          else
+          {
+            Serial.print("Cliente MQTT falhou ao conectar - mensagem: ");
+            Serial.println(client.state());
+            mqttConection = false;
+
+            Serial.println("MQTT conection error!");
+            countMqtt++;
+
+            delay(1000);
+
+            if(countMqtt >= 5){
+              ESP.restart();
+            } // countMqtt >= 5
+          }
+        } // !client.connected()
+
+        if (mqttConection)
+        {
+          // Exibindo as informacoes no monitor Serial
+          delay(500);
+          Serial.print(".");
+
+          client.subscribe("gateway/mac");
+          client.subscribe("esp32/collect");
+          client.subscribe("esp32/update");
+
+          client.publish("esp32/mac", macAddressValueExit);
+
+          Serial.println("Dinamic Mac Address sent!");
+          Serial.println(" ");
+
+          Serial.println("|----------------|");
+          Serial.println("|setup_routing();|");
+          Serial.println("|----------------|");
+          Serial.println(" ");
+
+          setup_routing();
+          
+        } // mqttConection
+
+      } // if ipString == "0.0.0.0"
+      else if (ipString != ipJson && ipJson != "") // Se configurado IP Estático
+      {
+        ip.fromString(jsonIp);
+        gt.fromString(jsonGt);
+        nt.fromString(jsonNm);
+
+        wifiManager.setSTAStaticIPConfig(ip, gt, nt);
+
+        wifiManager.autoConnect(endpointSSID, "hitiotv2"); // Função para se autoconectar na rede
+        wifiManager.stopConfigPortal();
+
+        WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 1); //disable brownout detector
+
+        wifiConfig = false;
+        wifiConnected = true;
+
+        client.setServer(jsonGw, mqttPort);
+        client.setCallback(callback);
+
+        Serial.println();
+
+        dinamicMac = WiFi.macAddress();
+        macAddressValue = dinamicMac + " ";
+        topicValue = "esp32/mac/" + dinamicMac + " ";
+        macAddressJson = "\"Mac\":\"" + dinamicMac + "\", ";
+
+        topicValue.toCharArray(topicExit, topicValue.length());
+        macAddressValue.toCharArray(macAddressValueExit, macAddressValue.length());
+        macAddressJson.toCharArray(macAddressExit, macAddressJson.length());
+
+        delay(500);
+
+        firmwareValue = "\"Firm\":\"" + firmware + "\", ";
+        firmwareValue.toCharArray(firmwareExit, firmwareValue.length());
+
+        versionValue = "\"Ver\":\"" + vers + "\", ";
+        versionValue.toCharArray(versionExit, versionValue.length());
+
+        esp32IP = WiFi.localIP().toString();
+        esp32IPValue = "\"Ip\":\"" + esp32IP + "\" ";
+        esp32IPValue.toCharArray(esp32IPExit, esp32IPValue.length());
+
+        Serial.print("ESP Board Mac Address:  ");Serial.println(dinamicMac);
+        Serial.print("ESP Board IP Address:  ");Serial.println(esp32IP);
+        Serial.print("ESP Board Firmware Version:  ");Serial.println(firmware);
+
+        //delay(500);
+
+        Serial.println();
+
+        // setup_routing();
+
+        if (!client.connected())
+        {
+          Serial.println("Conectando ao broker MQTT");
+          delay(1000);
+          if (client.connect(macAddressValueExit, mqttUser, mqttPass))
+          {
+            mqttConection = true;
+            Serial.println("Cliente MQTT conectado!");
+          }
+          else
+          {
+            Serial.print("Cliente MQTT falhou ao conectar - mensagem: ");
+            Serial.println(client.state());
+            mqttConection = false;
+
+            Serial.println("MQTT conection error!");
+            countMqtt++;
+
+            delay(1000);
+
+            if(countMqtt >= 5){
+              ESP.restart();
+            } // countMqtt >= 5
+          }
+        } // !client.connected()
+
+        if (mqttConection)
+        {
+          // Exibindo as informacoes no monitor Serial
+          delay(500);
+          Serial.print(".");
+
+          client.subscribe("gateway/mac");
+          client.subscribe("esp32/collect");
+          client.subscribe("esp32/update");
+
+          client.publish("esp32/mac", macAddressValueExit);
+
+          Serial.println("Dinamic Mac Address sent!");
+          Serial.println(" ");
+
+          Serial.println("|----------------|");
+          Serial.println("|setup_routing();|");
+          Serial.println("|----------------|");
+          Serial.println(" ");
+
+          setup_routing();
+          
+        } // mqttConection
+
+      } // else ipString == "0.0.0.0"
+      else if (ipString != ipJson && ipJson == "")
+      { 
+        Serial.println(" ");
+        Serial.println("ESP32 não configurado!");
+        Serial.println("Insira o comando: \"start\" para iniciar o processo de configuração");
+        Serial.println(" ");
+      } // ipString != ipJson && ipJson == ""
+
+    } // String(jsonConfig) == "stable"
+    else if (String(jsonConfig) == "config")
+    {
+      // Posiciona o ponteiro do arquivo no início
+      ObjFS.rewind();
+
+      StaticJsonDocument<200> doc; // Memory pool
+
+      // Percorre todos os registros
+      if (ObjFS.readFileNextRecord(&linha, &errorMsg))
+      {
+        reg = linha;
+        reg.toCharArray(regJson, reg.length());
+        delay(100);
+        Serial.print("JSON: ");
+        Serial.println(regJson);
+
+        // Trata as informações do JSON
+        auto error = deserializeJson(doc, regJson);
+
+        Serial.println("Wifi Config == True");
+
+        if (error)
+        {
+          Serial.print(F("deserializeJson() failed with code "));
+          Serial.println(error.c_str());
+        }
+        else
+        {
+          Serial.println("Abertura Portal"); // Abre o portal no endereço 192.168.4.1/
+          delay(500);
+          Serial.println();
+
+          dinamicMac = WiFi.macAddress();
+          macAddressValue = dinamicMac + " ";
+          topicValue = "esp32/mac/" + dinamicMac + " ";
+          macAddressJson = "\"Mac\":\"" + dinamicMac + "\", ";
+
+          String endpointNetwork = "Net-Endpoint-"+ macAddressValue;
+          char endpointSSID[40];
+
+          endpointNetwork.toCharArray(endpointSSID, endpointNetwork.length());
+
+          wifiManager.autoConnect(endpointSSID, "defaultfatec"); // Função para se autoconectar na rede
+
+          fs_ip = wifiManager.WiFiManagerFSIP();
+          fs_gt = wifiManager.WiFiManagerFSGW();
+          fs_nm = wifiManager.WiFiManagerFSNM();
+          fs_gw = wifiManager.WiFiManagerFSGT();
+
+          String jsonToken = doc["Tkn"];
+          String jsonCnt = doc["Cnt"];
+
+          value = "{\"Ip\":\""+ fs_ip +"\",\"Gt\":\""+ fs_gt +"\",\"Nm\":\""+ fs_nm +"\",\"Gw\":\""+ fs_gw +"\",\"Tkn\":\""+ jsonToken +"\",\"Cfg\":\"stable\",\"Cnt\":\""+ jsonCnt +"\"} ";
+
+          ObjFS.destroyFile();
+
+          Serial.println("----------------------------");
+          Serial.println(value);
+          Serial.println("----------------------------");
+
+          if (value != "" && !ObjFS.writeFile(value, &errorMsg))
+          {
+            Serial.println(errorMsg);
+          }    // values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+          else // values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+          {
+            Serial.println("Save File Ok");
+          } // else values != "" && !ObjFSIP.writeFile(values, &errorMsg)
+
+          wifiManager.stopConfigPortal();
+          ESP.restart();
+        } // error deserializing
+      }   // if(ObjFS.readFileNextRecord(&linha, &errorMsg) && wifiConfig)
+    } // String(jsonConfig) == "config"
+
+  } // else if (!wifiConfig && !wifiConnected)
+  else if (wifiConnected)
+  {
+    if (!client.connected())
+    {
+      Serial.println("Conectando ao broker MQTT");
+      delay(1000);
+      if (client.connect(macAddressValueExit, mqttUser, mqttPass))
+      {
+        mqttConection = true;
+        Serial.println("Cliente MQTT conectado!");
+
+        client.subscribe("gateway/mac");
+        client.subscribe("esp32/collect");
+        client.subscribe("esp32/update");
+
+      }
+      else
+      {
+        Serial.print("Cliente MQTT falhou ao conectar - mensagem: ");
+        Serial.println(client.state());
+        mqttConection = false;
+
+        Serial.println("MQTT conection error!");
+        countMqtt++;
+
+        delay(1000);
+
+        if(countMqtt >= 5){
+          ESP.restart();
+        } // countMqtt >= 5
+      }
+    } // !client.connected()
+
+    if (mqttConection)
+    {
+      Serial.println(" ");
+      delay(100);
+
+      client.loop(); // MQTT 
+      server.handleClient(); // REST API
+
+      if (i < 1)
+      {
+        Serial.println("| ------------------------------ |");
+        Serial.print("| Connected IP: ");Serial.print(esp32IP);Serial.println("     |");
+        Serial.print("| MAC Address: ");Serial.print(dinamicMac);Serial.println(" |");
+        Serial.println("| ------------------------------ |");
+        Serial.println(" ");
+        i++;
+
+        delay(3000);
+      }
+
+      if (i == 1)
+      {
+        countMqtt = 0;
+        i++;
+        Serial.print("HELP LINK: ");
+        Serial.println("/update");
+        Serial.println(" ");
+      }
+
+      // Leitura dos sensores
+
+      /*static boolean newDataReady = 0;
+      const int serialPrintInterval = 0; //increase value to slow down serial print activity
+
+      // check for new data/start next conversion:
+      if (LoadCell.update()) newDataReady = true;
+
+      // get smoothed value from the dataset:
+      if (newDataReady) {
+        if (millis() > t + serialPrintInterval) {
+          weight = LoadCell.getData();
+          Serial.print("Load_cell output val: ");
+          if (weight<=0){ weight = 0; }
+          Serial.println(weight);
+          newDataReady = 0;
+          t = millis(); // intervalo de leitura
+        } // if (millis() > time + serialPrintInterval)
+      } // newDataReady 
+
+      // receive command from serial terminal, send 't' to initiate tare operation:
+      if (Serial.available() > 0) {
+        char inByte = Serial.read();
+        if (inByte == 't') LoadCell.tareNoDelay();
+      } // if (Serial.available() > 0)
+
+      // check if last tare operation is complete:
+      if (LoadCell.getTareStatus() == true) {
+        Serial.println("Tare complete");
+      } // if (LoadCell.getTareStatus() == true)*/
+
+      // Trataiva dos dados dos sensores e montagem do JSON com eles
+
+      sensor1Data = dhtSensor1.getTempAndHumidity();
+
+      valorldr=analogRead(ldr);
+      luminosidade = (valorldr - 4095) * -0.02442002442002442002442002442002; // Calibração
+      
+      Serial.print("LDR = "); Serial.print(valorldr);
+      Serial.print(" - Luminosidade: "); Serial.print(luminosidade); Serial.println("%");
+
+      Serial.print("Som: "); Serial.print(dB); Serial.println(" dB");
+
+      weightValue = "\"Peso\":\"" + String((weight),1) + "\", ";
+      lumiValue = "\"Lumi\":\"" + String(luminosidade) + "\", ";
+      soundValue = "\"Sound\":\"" + String(dB) + "\", ";
+      dhtTempValue = "\"Temp\":\"" + String(sensor1Data.temperature, 1) + "\", ";
+      dhtHumiValue = "\"Umid\":\"" + String(sensor1Data.humidity, 1) + "\", ";
+
+      weightValue.toCharArray(weightExit, weightValue.length());
+      lumiValue.toCharArray(lumiExit, lumiValue.length());
+      soundValue.toCharArray(soundExit, soundValue.length());
+      dhtTempValue.toCharArray(dhtTempExit, dhtTempValue.length());
+      dhtHumiValue.toCharArray(dhtHumiExit, dhtHumiValue.length());
+
+      // Envio dos dados por MQTT e exibição deles na Serial
+  
+      Serial.print("topic: ");Serial.print(topicExit);Serial.print(" message: ");Serial.println(startExit);
+      Serial.print("topic: ");Serial.print(topicExit);Serial.print(" message: ");Serial.println(macAddressExit);
+      Serial.print("topic: ");Serial.print(topicExit);Serial.print(" message: ");Serial.println(weightExit);
+      Serial.print("topic: ");Serial.print(topicExit);Serial.print(" message: ");Serial.println(lumiExit);
+      Serial.print("topic: ");Serial.print(topicExit);Serial.print(" message: ");Serial.println(soundExit);
+      Serial.print("topic: ");Serial.print(topicExit);Serial.print(" message: ");Serial.println(dhtTempExit);
+      Serial.print("topic: ");Serial.print(topicExit);Serial.print(" message: ");Serial.println(dhtHumiExit);
+      Serial.print("topic: ");Serial.print(topicExit);Serial.print(" message: ");Serial.println(firmwareExit);
+      Serial.print("topic: ");Serial.print(topicExit);Serial.print(" message: ");Serial.println(versionExit);
+      Serial.print("topic: ");Serial.print(topicExit);Serial.print(" message: ");Serial.println(esp32IPExit);
+      Serial.print("topic: ");Serial.print(topicExit);Serial.print(" message: ");Serial.println(endExit);
+
+    } // mqttConection
+    else if (!mqttConection)
+    {
+      Serial.println("MQTT conection error!");
+      countMqtt++;
+
+      delay(1000);
+
+      if(countMqtt >= 5){
+        ESP.restart();
+      } // countMqtt >= 5
+    } // else if (!mqttConection)
+    
+  } // else if (wifiConnected)
+
+} // loop
+
+// Função de reset das informações para o modo de fábrica
+void checkSound()
+{
+  while(cont < 10000)
+      {
+        ValorSensor = analogRead(ruido);
+        if(ValorSensor > valorMaior)
+        {
+          valorMaior = ValorSensor;
+        }
+        cont++;
+      }
+      cont = 0;
+
+      tensao = valorMaior / 1023.0 * 0.720;
+      dB = (103.1 * tensao - 115.4) * 0.5;
+      
+      if(dB < 0){ dB = 0; }
+      
+      valorMaior = 0;
+} // checkSound
+
+void callback(char *topic, byte *payload, unsigned int length)
+{
+
+  Serial.print("Message arrived in topic: ");
+  Serial.println(topic);
+  topicReceived = topic;
+
+  Serial.print("Message: ");
+  for (int i = 0; i < length; i++)
+  {
+    Serial.print((char)payload[i]);
+    messageReceived += (char)payload[i];
+  }
+  Serial.println(" ");
+
+  if (topicReceived == "esp32/collect")
+  {
+    if (messageReceived == "all")
+    {
+      Serial.print("Collect data of: ");
+      Serial.print(messageReceived);
+      Serial.println(" sensors!!!");
+      Serial.println("Sending JSON!");
+
+      client.publish(topicExit, startExit);
+      client.publish(topicExit, macAddressExit);
+      client.publish(topicExit, weightExit);
+      client.publish(topicExit, lumiExit);
+      client.publish(topicExit, soundExit);
+      client.publish(topicExit, dhtTempExit);
+      client.publish(topicExit, dhtHumiExit);
+      client.publish(topicExit, firmwareExit);
+      client.publish(topicExit, versionExit);
+      client.publish(topicExit, esp32IPExit);
+      client.publish(topicExit, endExit);
+      // Grants the JSON collect
+      client.publish(topicExit, startExit);
+      client.publish(topicExit, macAddressExit);
+      client.publish(topicExit, weightExit);
+      client.publish(topicExit, lumiExit);
+      client.publish(topicExit, soundExit);
+      client.publish(topicExit, dhtTempExit);
+      client.publish(topicExit, dhtHumiExit);
+      client.publish(topicExit, firmwareExit);
+      client.publish(topicExit, versionExit);
+      client.publish(topicExit, esp32IPExit);
+      client.publish(topicExit, endExit);
+
+      client.publish("esp32/status", "OK");
+
+      client.publish("esp32/sender", macAddressValueExit);
+
+      delay(3000); // implementar um Time await de 3 segundos caso o delay esteja interrompendo a conexão
+
+      Serial.println("| client.publish(esp32/sender, zabbixSender); |");
+      Serial.println(" ");
+
+    } // messageReceived == "all"
+    else if (messageReceived != "" && messageReceived != "all")
+    {
+      Serial.print("Collect data of: ");
+      Serial.print(messageReceived);
+      Serial.println(" sensor!!!");
+      sensor = messageReceived;
+    } // else if messageReceived != "" && messageReceived != "all"
+    else
+    {
+      Serial.println("Invalid command!!!");
+    } // else messageReceived != "" && messageReceived != "all"
+
+    topicReceived = "";
+    messageReceived = "";
+  } // topicReceived == "esp32/collect"
+
+  if (topicReceived == "esp32/update")
+  {
+    if (messageReceived == "all")
+    {
+      // Posiciona o ponteiro do arquivo no início
+      if (!ObjFS.fileExists())
+      {
+        Serial.println("New file");
+        ObjFS.newFile(); // Cria o arquivo
+      }                       // !ObjFS.fileExists()
+
+      // Posiciona o ponteiro do arquivo no início
+      ObjFS.rewind();
+
+      StaticJsonDocument<200> doc; // Memory pool
+
+      linha = " ";
+      Serial.print("linha: ");
+      Serial.println(linha);
+
+      // Percorre todos os registros
+      while (ObjFS.readFileNextRecord(&linha, &errorMsg) && linha != "")
+      {
+        reg = linha;
+        reg.toCharArray(regJson, reg.length());
+        delay(100);
+        Serial.print("JSON: ");Serial.println(regJson);
+
+        // Trata as informações do JSON
+        auto error = deserializeJson(doc, regJson);
+
+        if (error)
+        {
+          Serial.print(F("deserializeJson() failed with code "));
+          Serial.println(error.c_str());
+
+          Serial.println(" ");
+          Serial.println("ESP32 não configurado!");
+          Serial.println("Insira o comando: \"start\" para iniciar o processo de configuração");
+          Serial.println(" ");
+
+          return;
+        } // error deserializing
+
+      } // while(ObjFS.readFileNextRecord(&linha, &errorMsg) && lina!= "")
+
+      const char *jsonGw = doc["Gw"];
+
+      Serial.print("Gw: ");Serial.println(jsonGw);
+
+      espOtaUrl = "http://"+ String(jsonGw) +":8000/"+ firmware +".ino.bin"; // http://192.168.1.1:8000/espOtafatec.ino.bin
+
+      while (otaConection <= 20)
+      {
+        t_httpUpdate_return ret = ESPhttpUpdate.update(espOtaUrl);
+        switch (ret)
+        {
+        case HTTP_UPDATE_FAILED:
+          Serial.println("HTTP_UPDATE_FAILED!!!");
+          break;
+
+        case HTTP_UPDATE_NO_UPDATES:
+          Serial.println("HTTP_UPDATE_NO_UPDATES!!!");
+          break;
+        } // switch(ret)
+        otaConection++;
+      } // ota <= 20
+      otaConection = 0;
+    } // messageReceived == "all"
+
+    topicReceived = "";
+    messageReceived = "";
+  } // topicReceived == "esp32/update"
+
+  if (topicReceived == "gateway/mac")
+  {
+    token = "G" + messageReceived + "E" + dinamicMac + "T";
+
+    Serial.print("Rest Api Token: ");
+    Serial.println(token);
+
+    if (!ObjFS.fileExists())
+    {
+      Serial.println("New file");
+      ObjFS.newFile(); // Cria o arquivo
+    } // !ObjFS.fileExists()
+
+    // Posiciona o ponteiro do arquivo no início
+    ObjFS.rewind();
+
+    StaticJsonDocument<200> doc; // Memory pool
+    linha = " ";
+    Serial.print("linha: ");
+    Serial.println(linha);
+
+    // Percorre todos os registros
+    if (ObjFS.readFileNextRecord(&linha, &errorMsg) && linha != "")
+    {
+      reg = linha;
+      Serial.print("reg: ");
+      Serial.println(reg);
+      Serial.print("linha: ");
+      Serial.println(linha);
+      reg.toCharArray(regJson, reg.length());
+      delay(100);
+      Serial.print("JSON: ");
+      Serial.println(regJson);
+
+      // Trata as informações do JSON
+      auto error = deserializeJson(doc, regJson);
+
+      if (error)
+      {
+        Serial.print(F("deserializeJson() failed with code "));
+        Serial.println(error.c_str());
+
+        Serial.println("Token para Api Rest não configurado!");
+        Serial.println(" ");
+
+        return;
+      } // error deserializing
+      else
+      {
+        String jsonIp = doc["Ip"];
+        String jsonGt = doc["Gt"];
+        String jsonNm = doc["Nm"];
+        String jsonGw = doc["Gw"];
+        String jsonConfig = doc["Cfg"];
+        String jsonCnt = doc["Cnt"];
+
+        value = "{\"Ip\":\""+ jsonIp +"\",\"Gt\":\""+ jsonGt +"\",\"Nm\":\""+ jsonNm +"\",\"Gw\":\""+ jsonGw +"\",\"Tkn\":\""+ token +"\",\"Cfg\":\""+ jsonConfig +"\",\"Cnt\":\""+ jsonCnt +"\"} ";
+
+        Serial.println("----------------------------------------------------------------------------------------------------------------");
+        Serial.println(value);
+        Serial.println("----------------------------------------------------------------------------------------------------------------");
+
+        ObjFS.destroyFile();
+
+        if (value != "" && !ObjFS.writeFile(value, &errorMsg))
+        {
+          Serial.println(errorMsg);
+        }    // values != "" && !ObjFS.writeFile(values, &errorMsg)
+        else // values != "" && !ObjFS.writeFile(values, &errorMsg)
+        {
+          Serial.println("Save File Ok");
+        } // else values != "" && !ObjFS.writeFile(values, &errorMsg)
+      } // else error deserializing
+    } // ObjFS.readFileNextRecord(&linha, &errorMsg) && linha != ""
+
+    setup_routing();
+
+    topicReceived = "";
+    messageReceived = "";
+  } // topicReceived == "gateway/mac"
+
+  Serial.println();
+  Serial.println("-----------------------");
+
+} // callback
+
+void timeAwait()
+{
+  // delay(20000);
+  await = 21;
+  progress = timer * 5;
+
+  Serial.print("Initializing: ");
+
+  for (timer >= 0; timer <= await; timer++)
+  {
+    Serial.print(progress);
+    Serial.print("% ");
+    progress = timer * 5;
+    delay(1000);
+  }
+
+  Serial.println(" ");
+}
+
+void setup_routing()
+{
+
+  // Posiciona o ponteiro do arquivo no início
+  ObjFS.rewind();
+
+  StaticJsonDocument<200> doc; // Memory pool
+  linha = " ";
+  Serial.print("linha: ");
+  Serial.println(linha);
+
+  // Percorre todos os registros
+  if (ObjFS.readFileNextRecord(&linha, &errorMsg) && linha != "")
+  {
+    reg = linha;
+    Serial.print("reg: ");
+    Serial.println(reg);
+    Serial.print("linha: ");
+    Serial.println(linha);
+    reg.toCharArray(regJson, reg.length());
+    delay(100);
+    Serial.print("JSON: ");
+    Serial.println(regJson);
+
+    // Trata as informações do JSON
+    auto error = deserializeJson(doc, regJson);
+
+    if (error)
+    {
+      Serial.print(F("deserializeJson() failed with code "));
+      Serial.println(error.c_str());
+
+      Serial.println("Token para Api Rest não configurado!");
+      Serial.println(" ");
+
+      return;
+    } // error deserializing
+    else
+    {
+      String bar = "/";
+      String jsonToken = doc["Tkn"];
+      String urlToken = bar + jsonToken;
+      String urlUpdate = urlToken +"/update";
+
+      // jsonToken.toCharArray(authentication, jsonToken.length());
+
+      // start server
+      server.on(urlToken, [](){
+        if (!server.authenticate(auth_username, auth_password))
+        {
+          return server.requestAuthentication();
+          // return server.requestAuthentication(DIGEST_AUTH, authentication, authFailResponse);
+        }
+        getEnv();
+      });
+
+      server.on(urlUpdate, [](){
+        if (!server.authenticate(auth_username, auth_password))
+        {
+          return server.requestAuthentication();
+          // return server.requestAuthentication(DIGEST_AUTH, authentication, authFailResponse);
+        }
+        getUpdate();
+      });
+
+      server.onNotFound(getNotFound);
+      server.begin();
+    }
+  }
+  else
+  {
+    Serial.println("Token para Api Rest não configurado!");
+    Serial.println(" ");
+  }
+
+} // setup_routing
+
+void getEnv()
+{
+  String jsonExit = String(startExit) + String(macAddressExit) + String(weightExit) + String(lumiExit) + String(soundExit) + String(dhtTempExit) + String(dhtHumiExit) + String(firmwareExit) + String(esp32IPExit) + String(endExit);
+  server.send(200, "application/json", jsonExit);
+} // getEnv
+
+void getUpdate()
+{
+  Serial.println("Get Update firmware");
+  server.send(200, "application/json", "Atualização em andamento!!!");
+  
+  // Posiciona o ponteiro do arquivo no início
+  if (!ObjFS.fileExists())
+  {
+    Serial.println("New file");
+    ObjFS.newFile(); // Cria o arquivo
+  }                       // !ObjFS.fileExists()
+
+  // Posiciona o ponteiro do arquivo no início
+  ObjFS.rewind();
+
+  StaticJsonDocument<200> doc; // Memory pool
+
+  linha = " ";
+  Serial.print("linha: ");
+  Serial.println(linha);
+
+  // Percorre todos os registros
+  while (ObjFS.readFileNextRecord(&linha, &errorMsg) && linha != "")
+  {
+    reg = linha;
+    reg.toCharArray(regJson, reg.length());
+    delay(100);
+    Serial.print("JSON: ");Serial.println(regJson);
+
+    // Trata as informações do JSON
+    auto error = deserializeJson(doc, regJson);
+
+    if (error)
+    {
+      Serial.print(F("deserializeJson() failed with code "));
+      Serial.println(error.c_str());
+      
+      Serial.println(" ");
+      Serial.println("ESP32 não configurado!");
+      Serial.println("Insira o comando: \"start\" para iniciar o processo de configuração");
+      Serial.println(" ");
+
+      return;
+    } // error deserializing
+
+  } // while(ObjFS.readFileNextRecord(&linha, &errorMsg) && lina!= "")
+
+  const char *jsonGw = doc["Gw"];
+
+  Serial.print("Gw: ");Serial.println(jsonGw);
+
+  espOtaUrl = "http://"+ String(jsonGw) +":8000/"+ firmware +".ino.bin"; // http://192.168.1.1:8000/espOtafatec.ino.bin
+  
+  while (otaConection <= 20)
+  {
+    t_httpUpdate_return ret = ESPhttpUpdate.update(espOtaUrl);
+    switch (ret)
+    {
+    case HTTP_UPDATE_FAILED:
+      Serial.println("HTTP_UPDATE_FAILED!!!");
+      break;
+
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("HTTP_UPDATE_NO_UPDATES!!!");
+      break;
+    } // switch(ret)
+    otaConection++;
+  } // ota <= 20
+  otaConection = 0;
+} // getUpload
+
+void getNotFound()
+{
+  server.send(200, "text/html", "<body style='background-color: #ffffff;'><center style='padding: 80px 0px;'><img title=' alt=' src='' height='150px' padding='10%' ><h1>404</h1><h2>Not found</h2><p>The resource requested could not be found on this server!</p><p>Contact admin:&nbsp;<strong><a title='Support' href='https://google.com.br' target='_blank'>Support</a></strong></p></center></body>");
+  // server.send(200, "text/html", "<body style='background-color: #DE7233;padding: 30px 0;'><center style='padding: 8% 8%;'><img src='' alt='HIoT' width='254' height='113' style='background-color: #22333D; padding: 20px; border-radius: 10px;'><h1>404</h1><h2>Not found</h2><p>The resource requested could not be found on this server!</p><p>Contact admin:&nbsp;<strong><a title='Support' href='https://google.com.br' target='_blank'>Support</a></strong></p></center></body>");
+}
+
+// callback que indica que o ESP entrou no modo AP
+void configModeCallback(WiFiManager *myWiFiManager)
+{
+  if (endpointConfig == "stable"){
+    ESP.restart();
+  } // endpointConfig == "stable"
+  Serial.println("Entrou no modo de configuração");
+  Serial.println(WiFi.softAPIP());                      // imprime o IP do AP
+  Serial.println(myWiFiManager->getConfigPortalSSID()); // imprime o SSID criado da rede
+} // configModeCallback(WiFiManager *myWiFiManager)
+
+// Callback que indica que salvamos uma nova rede para se conectar (modo estação)
+void saveConfigCallback()
+{
+  Serial.println("Configuração salva");
+} // saveConfigCallback()
