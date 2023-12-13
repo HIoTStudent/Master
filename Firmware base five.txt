@@ -1,0 +1,102 @@
+#include <WiFi.h>
+#include <DHT.h>
+
+const char* ssid = "SuaSSID";
+const char* password = "SuaSenha";
+const char* zabbixServer = "IP_do_Servidor_Zabbix";
+const int zabbixPort = 10051;
+
+// Defina os pinos para o LED RGB
+const int bluePin = 12;
+const int yellowPin = 14;
+const int redPin = 27;
+
+// Defina os pinos para o sensor DHT11
+#define DHTPIN 4
+#define DHTTYPE DHT11
+
+DHT dht(DHTPIN, DHTTYPE);
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println("\nConectado à rede Wi-Fi");
+
+  // Configura os pinos do LED como saídas
+  pinMode(bluePin, OUTPUT);
+  pinMode(yellowPin, OUTPUT);
+  pinMode(redPin, OUTPUT);
+
+  dht.begin();
+}
+
+void loop() {
+  delay(2000);
+
+  // Realiza a leitura do sensor DHT11
+  float temperature = dht.readTemperature();
+
+  // Exibe a temperatura no Monitor Serial
+  Serial.print("Temperatura: ");
+  Serial.println(temperature);
+
+  // Atualiza os LEDs com base na temperatura
+  updateLEDs(temperature);
+
+  // Envia os dados para o Zabbix
+  sendToZabbix("Nome_do_Host", "Chave_Item_Temperatura", temperature);
+}
+
+void updateLEDs(float temperature) {
+  // Desliga todos os LEDs por padrão
+  digitalWrite(bluePin, LOW);
+  digitalWrite(yellowPin, LOW);
+  digitalWrite(redPin, LOW);
+
+  // Liga o LED azul se a temperatura for abaixo de 20 graus
+  if (temperature < 20) {
+    digitalWrite(bluePin, HIGH);
+    sendToZabbix("Nome_do_Host", "Chave_Item_Status", "Azul");
+  }
+  // Liga o LED amarelo se a temperatura estiver entre 20 e 26 graus
+  else if (temperature >= 20 && temperature <= 26) {
+    digitalWrite(yellowPin, HIGH);
+    sendToZabbix("Nome_do_Host", "Chave_Item_Status", "Amarelo");
+  }
+  // Liga o LED vermelho se a temperatura estiver acima de 26 graus
+  else if (temperature > 26) {
+    digitalWrite(redPin, HIGH);
+    sendToZabbix("Nome_do_Host", "Chave_Item_Status", "Vermelho");
+  }
+}
+
+void sendToZabbix(const char* host, const char* key, float value) {
+  WiFiClient client;
+  if (client.connect(zabbixServer, zabbixPort)) {
+    // Formata os dados no formato esperado pelo Zabbix Sender
+    String data = "{\"request\":\"sender data\",\"data\":[{\"host\":\"" + String(host) + "\",\"key\":\"" + String(key) + "\",\"value\":\"" + String(value) + "\"}]}";
+
+    // Envia os dados para o servidor Zabbix
+    client.print(data);
+
+    Serial.println("Dados enviados para o Zabbix");
+
+    // Aguarda a resposta do servidor (opcional)
+    while (client.connected()) {
+      String line = client.readStringUntil('\n');
+      if (line == "ZBXD\1") {
+        Serial.println("Resposta do Zabbix recebida com sucesso");
+      }
+    }
+  } else {
+    Serial.println("Falha ao conectar-se ao servidor Zabbix");
+  }
+
+  // Fecha a conexão
+  client.stop();
+}
