@@ -1,0 +1,83 @@
+#include <WiFi.h>
+
+const char* ssid = "SuaSSID";
+const char* password = "SuaSenha";
+const char* zabbixServer = "IP_do_Servidor_Zabbix";
+const int zabbixPort = 10051;
+
+// Defina os pinos para o LED RGB
+const int redPin = 12;
+const int greenPin = 14;
+const int yellowPin = 27;  // Alterado para representar a cor amarela
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println("\nConectado à rede Wi-Fi");
+
+  // Configura os pinos do LED RGB como saídas
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(yellowPin, OUTPUT);  // Atualizado para representar a cor amarela
+}
+
+void loop() {
+  // Define o tempo para cada estado do semáforo
+  int redTime = 5000;    // 5 segundos para o vermelho
+  int yellowTime = 2000; // 2 segundos para o amarelo
+  int greenTime = 5000;  // 5 segundos para o verde
+
+  // Acende o LED vermelho
+  updateRGBLed(1, 0, 0);
+  delay(redTime);
+
+  // Acende o LED amarelo
+  updateRGBLed(1, 1, 0);
+  delay(yellowTime);
+
+  // Acende o LED verde
+  updateRGBLed(0, 1, 0);
+  delay(greenTime);
+
+  // Envia o status para o Zabbix
+  sendToZabbix("Nome_do_Host", "Chave_Item_Status", "Vermelho");
+
+  // Repete o ciclo
+}
+
+void updateRGBLed(int red, int green, int yellow) {  // Atualizado para representar a cor amarela
+  digitalWrite(redPin, red);
+  digitalWrite(greenPin, green);
+  digitalWrite(yellowPin, yellow);  // Atualizado para representar a cor amarela
+}
+
+void sendToZabbix(const char* host, const char* key, const char* value) {
+  WiFiClient client;
+  if (client.connect(zabbixServer, zabbixPort)) {
+    // Formata os dados no formato esperado pelo Zabbix Sender
+    String data = "{\"request\":\"sender data\",\"data\":[{\"host\":\"" + String(host) + "\",\"key\":\"" + String(key) + "\",\"value\":\"" + String(value) + "\"}]}";
+
+    // Envia os dados para o servidor Zabbix
+    client.print(data);
+
+    Serial.println("Dados enviados para o Zabbix");
+
+    // Aguarda a resposta do servidor (opcional)
+    while (client.connected()) {
+      String line = client.readStringUntil('\n');
+      if (line == "ZBXD\1") {
+        Serial.println("Resposta do Zabbix recebida com sucesso");
+      }
+    }
+  } else {
+    Serial.println("Falha ao conectar-se ao servidor Zabbix");
+  }
+
+  // Fecha a conexão
+  client.stop();
+}
